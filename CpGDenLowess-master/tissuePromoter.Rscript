@@ -1,0 +1,143 @@
+#!/usr/bin/env Rscript
+
+# mtbr pipline
+
+# Load libraries
+
+suppressPackageStartupMessages(library("optparse", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("data.table", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("zoo", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("methyutils", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("IRanges", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+
+
+getScriptPath <- function(){
+    cmd.args <- commandArgs()
+    m <- regexpr("(?<=^--file=).+", cmd.args, perl=TRUE)
+    script.dir <- dirname(regmatches(cmd.args, m))
+    if(length(script.dir) == 0) stop("can't determine script dir: please call the script with Rscript")
+    if(length(script.dir) > 1) stop("can't determine script dir: more than one '--file' argument detected")
+    return(script.dir)
+}
+
+source(paste(getScriptPath(),"/cgDensity.lib.R", sep = ""), chdir = TRUE)
+##Specify desired options in a list
+
+option_list <- list(
+
+    make_option(c("-l","--genome-library"), help="Bioconductor BSgenome library name", default = "BSgenome.Mmusculus.UCSC.mm9"),
+    make_option(c("-n","--genome-name"), help="genome library object name. ex: \"Mmusculus\", \"Hsapiens\", \"Scerevisiae\"", default = "Mmusculus"),
+    make_option(c("-t","--genome-type"), help="genome type , example mm9, mm10, hg19, hg18, default is NULL", default = ""),
+    make_option(c("-r","--promoter-range"), help="Promoter range", default = 1000),
+    make_option(c("-w","--window-size"), help="sliding window size , default is 2500", default = 2500)
+    
+)
+
+# Get command line options
+arguments <- parse_args(OptionParser(usage = "%prog [options] gene.csv samplePath", option_list = option_list), positional_arguments = 2)
+opt <- arguments$options
+
+kGenomeLibrary <- opt$`genome-library`
+kGenomeName <- opt$`genome-name`
+kGenomeType <- opt$`genome-type`
+kPromoterRange <- opt$`promoter-range`
+kWindowSize <- opt$`window-size`
+
+kGenedb <- arguments$args[1]
+kSamplePath <- arguments$args[2]
+
+# load the genome library
+
+kGenomeTypeList <- list(
+	mm9  = list(genome.library="BSgenome.Mmusculus.UCSC.mm9",genome.name="Mmusculus"),
+	mm10 = list(genome.library="BSgenome.Mmusculus.UCSC.mm10",genome.name="Mmusculus"),
+	hg18 = list(genome.library="BSgenome.Hsapiens.UCSC.hg18",genome.name="Hsapiens"),
+	hg19 = list(genome.library="BSgenome.Hsapiens.UCSC.hg19",genome.name="Hsapiens"),
+	hg38 = list(genome.library="BSgenome.Hsapiens.UCSC.hg38",genome.name="Hsapiens")
+)
+kGenome <- NULL
+
+if ( kGenomeType %in% names(kGenomeTypeList) ){
+	suppressPackageStartupMessages(library(kGenomeTypeList[[kGenomeType]][["genome.library"]], character.only = TRUE, quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+	kGenome <- get(kGenomeTypeList[[kGenomeType]][["genome.name"]]) 
+}else {
+	suppressPackageStartupMessages(library(kGenomeLibrary, character.only = TRUE, quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+	kGenome <- get(kGenomeName) 
+}
+
+if ( is.null(kGenome)){
+	stop( "Load Biocondutor Genome Library ERROR " )
+}
+
+# Get sample file path
+
+if(!file.exists(kSamplePath)){
+	stop("sample file path \"", kSamplePath ,"\" does not exist.")
+}
+
+sample.names <- list.files(kSamplePath)
+
+if(!file.exists(kGenedb)){
+	stop("gene database file \"", kGenedb ,"\" does not exist.")
+}
+
+
+# read and process  gene csv file and tissues cgmtbr files
+
+gene.csv <- read.table(kGenedb, header = TRUE, sep = "\t")
+df.gene <- as.data.frame(table(gene.csv$geneSymbol))
+df.gene.sel <- df.gene[df.gene$Freq >= 2,]
+gene.multi.promoter <- gene.csv[gene.csv$geneSymbol %in% df.gene.sel$Var1,]
+gene.multi.promoter$id <- 1:nrow(gene.multi.promoter)
+gene.multi.promoter$promStart <- with(gene.multi.promoter, txStart - kPromoterRange)
+gene.multi.promoter$promEnd <- with(gene.multi.promoter, txStart + kPromoterRange)
+gene.multi.promoter$promStart[gene.multi.promoter$strand == "-"] <- with(gene.multi.promoter[gene.multi.promoter$strand == "-",], txEnd - kPromoterRange)
+gene.multi.promoter$promEnd[gene.multi.promoter$strand == "-"] <- with(gene.multi.promoter[gene.multi.promoter$strand == "-",], txEnd + kPromoterRange)
+gene.multi.promoter <- gene.multi.promoter[order(gene.multi.promoter$geneSymbol),]
+gene.multi.promoter$promId <- as.data.table(gene.multi.promoter)[,.(id = c(1:length(chrom))), by = geneSymbol]$id
+gene.multi.promoter.expand <- as.data.table(gene.multi.promoter)[,.(posi = promStart:promEnd, chrom, geneSymbol), by = id]
+
+# process by sample
+
+for (sample.name in sample.names){
+
+	gene.multi.promoter[, sample.name] <- 0
+ 	sample.mtbr.path <- paste(kSamplePath, "/", sample.name, "/mtbr_cg/", sep="")
+ 	message("[*] Processing ", sample.name, "\t", date())
+ 	chr.mtbr.files <- list.files(sample.mtbr.path)
+ 	for (chr.mtbr.file in chr.mtbr.files){
+ 		mtbr.file <- paste(sample.mtbr.path, chr.mtbr.file, sep = "")
+ 		load(mtbr.file)
+	 	chr.name <- unlist(strsplit(basename(chr.mtbr.file), ".", fixed = TRUE))[1]
+
+	 	# get CG Density
+	
+	 	message(chr.name, "\tgetting CG density ", "\t", date())
+	 	
+	 	dna.seq <- kGenome[[chr.name]]
+	 	ref.length <- length(dna.seq)
+		density <- GetDensity(cg.mtbr, kWindowSize, ref.length)
+
+		# get Score 
+		
+		message(chr.name, "\tgetting Score ", "\t", date())
+		score <- GetScore(cg.mtbr, kWindowSize, ref.length)
+
+	 	# rescale
+
+		message(chr.name, "\trescaling ", "\t", date())
+	 	rescale.data <- RescaleData(density, score)
+ 		rescale.data$pos <- 1:nrow(rescale.data)
+        dt.rescale.data <- data.table(rescale.data)
+
+        # calculate region score
+
+       	chr.promoter.expand <- gene.multi.promoter.expand[gene.multi.promoter.expand$chrom == chr.name,]
+       	chr.promoter.expand$score <- dt.rescale.data$score[chr.promoter.expand$pos]
+       	rg.score <- as.data.table(chr.promoter.expand)[,.(score = mean(score)), by = id]$score
+
+       	gene.multi.promoter[gene.multi.promoter$chrom == chr.name, ][, sample.name] <- rg.score
+ 	}
+}
+
+write.table(gene.multi.promoter, "./gene.multi.promoter.csv", row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t")

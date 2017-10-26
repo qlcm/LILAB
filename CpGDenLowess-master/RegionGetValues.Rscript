@@ -1,0 +1,167 @@
+#!/usr/bin/env Rscript
+
+# find region methylation Value
+
+# load library
+
+suppressPackageStartupMessages(library("optparse", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("methyutils", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("reshape2", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("data.table", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+
+##Specify desired options in a list
+
+option_list <- list(
+    make_option(c("-m","--mtbr-path"), help="used to read the samples cg.mtbr file", default = "./"),
+    make_option(c("-c","--cover-num"), help="set min cg mtbr cover number", default = 4),
+    make_option(c("-l","--genome-library"), help="Bioconductor BSgenome library name", default = "BSgenome.Mmusculus.UCSC.mm9"),
+    make_option(c("-n","--genome-name"), help="genome library object name. ex: \"Mmusculus\", \"Hsapiens\", \"Scerevisiae\"", default = "Mmusculus"),
+    make_option(c("-t","--genome-type"), help="genome type , example mm9, mm10, hg19, hg18, default is NULL", default = ""),
+
+    make_option(c("-o","--output-path"), help=" use to save the result", default = "./")
+)
+
+# Get command line options
+
+arguments <- parse_args(OptionParser(usage = "%prog [options] regionPath", option_list = option_list), positional_arguments = 1)
+opt <- arguments$options
+
+kMtbrPath <- opt$`mtbr-path`
+kCoverNum <- opt$`cover-num`
+kOutputPath <- opt$`output-path`
+kGenomeLibrary <- opt$`genome-library`
+kGenomeName <- opt$`genome-name`
+kGenomeType <- opt$`genome-type`
+
+kRegionPath <- arguments$args
+
+
+# load the genome library
+
+kGenomeTypeList <- list(
+	mm9  = list(genome.library="BSgenome.Mmusculus.UCSC.mm9",genome.name="Mmusculus"),
+	mm10 = list(genome.library="BSgenome.Mmusculus.UCSC.mm10",genome.name="Mmusculus"),
+	hg18 = list(genome.library="BSgenome.Hsapiens.UCSC.hg18",genome.name="Hsapiens"),
+	hg19 = list(genome.library="BSgenome.Hsapiens.UCSC.hg19",genome.name="Hsapiens"),
+	hg38 = list(genome.library="BSgenome.Hsapiens.UCSC.hg38",genome.name="Hsapiens")
+)
+kGenome <- NULL
+
+if ( kGenomeType %in% names(kGenomeTypeList) ){
+	suppressPackageStartupMessages(library(kGenomeTypeList[[kGenomeType]][["genome.library"]], character.only = TRUE, quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+	kGenome <- get(kGenomeTypeList[[kGenomeType]][["genome.name"]]) 
+}else {
+	suppressPackageStartupMessages(library(kGenomeLibrary, character.only = TRUE, quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+	kGenome <- get(kGenomeName) 
+}
+
+if ( is.null(kGenome)){
+	stop( "Load Biocondutor Genome Library ERROR " )
+}
+
+
+# Get region file names
+
+
+if(!file.exists(kRegionPath)){
+        stop("region file path \"", kRegionPath ,"\" does not exist.")
+}
+
+
+# Get simple file names in order to read the cg.mtbr file
+
+if(!file.exists(kMtbrPath)){
+        stop("project file path \"", kMtbrPath ,"\" does not exist.")
+}
+
+
+region.path <- file.path(kRegionPath)
+regions <- read.table(region.path, header = TRUE, sep = "\t")
+regions$id <- 1:nrow(regions)
+dt.regions <- as.data.table(regions)
+
+sample.filenames <- list.files(kMtbrPath)
+
+# find mtbr Value in the region 
+ for (sample.name in sample.filenames){
+    
+    sample.name.score <- paste(sample.name, "_score", sep = "")
+    sample.name.coverage <- paste(sample.name, "_coverage", sep = "")
+    sample.name.medianScore <- paste(sample.name, "_medianScore", sep = "")
+    sample.name.meanScore <- paste(sample.name, "_meanScore", sep = "")
+    sample.name.hmethy <- paste(sample.name, "_hmethy", sep = "")
+    sample.name.umethy <- paste(sample.name, "_umethy", sep = "")
+    sample.name.methyNum <- paste(sample.name, "_methyNum", sep = "")
+
+    regions[,"cgnum"] <- 0
+    regions[,sample.name.score] <- 0
+    regions[,sample.name.coverage] <- 0
+    regions[,sample.name.medianScore] <- 0
+    regions[,sample.name.meanScore] <- 0
+    regions[,sample.name.hmethy] <- 0
+    regions[,sample.name.umethy] <- 0
+    regions[,sample.name.methyNum] <- 0
+
+
+ 	sample.mtbr.path <- paste(kMtbrPath, "/", sample.name, "/mtbr_cg/", sep="")
+ 	message("[*] Processing ", sample.name, "\t", date())
+ 	# chr.mtbr.files <- list.files(sample.mtbr.path)
+ 	chr.names <- as.character(unique(regions$chr))
+ 	# for (chr.mtbr.file in chr.mtbr.files){
+ 	for (chr.name in chr.names){
+  		mtbr.file <- paste(sample.mtbr.path, chr.name, ".Rdata",sep = "")
+ 		load(mtbr.file)
+	 	# chr.name <- unlist(strsplit(basename(chr.mtbr.file), ".", fixed = TRUE))[1]
+
+	 	message(chr.name, "\tgetting median score ", "\t", date())
+		##
+		cg.mtbr$rC <- cg.mtbr$rC_n + cg.mtbr$rC_p
+		cg.mtbr$rT <- cg.mtbr$rT_n + cg.mtbr$rT_p
+		cg.mtbr <- cg.mtbr[cg.mtbr$rC + cg.mtbr$rT > kCoverNum,]
+		cg.mtbr$cover <- with(cg.mtbr, rC + rT)
+		cg.mtbr$score <- with(cg.mtbr, rC / (rC + rT))
+		
+	 	dna.seq <- kGenome[[chr.name]]
+	 	cg.pos <- start(matchPattern("CG", dna.seq))
+
+		#
+
+		dt.chr.regions.expend <- dt.regions[dt.regions$chr == chr.name, ][,.(posi = start : end), by = id]
+		dt.chr.regions.expend$cgnum <- 0
+		dt.chr.regions.expend$cgnum[dt.chr.regions.expend$posi %in% cg.pos] <- 1
+		dt.chr.regions.expend.merge <- merge(dt.chr.regions.expend, cg.mtbr, all.x = TRUE, by = "posi", sort = FALSE)
+		dt.chr.regions.expend.merge$Methy <- 0
+		dt.chr.regions.expend.merge$Methy[dt.chr.regions.expend.merge$score >= 0.8] <- 1
+		dt.chr.regions.expend.merge$Methy[dt.chr.regions.expend.merge$score <= 0.2] <- 2
+		
+		dt.chr.value <- data.table(dt.chr.regions.expend.merge)[,.(cgnum = sum(cgnum), coverage = sum(cover, na.rm = TRUE) , score = sum(rC, na.rm = TRUE) / sum(cover, na.rm = TRUE), medianScore = median(score, na.rm = TRUE), meanScore = mean(score, na.rm = TRUE),hmethy = sum(Methy == 1), umethy = sum(Methy == 2), methyNum =  sum(!is.na(score))), by = id] 
+
+		dt.chr.value.order <- dt.chr.value[order(dt.chr.value$id),]
+		regions[regions$chr == chr.name,][, "cgnum"] <- dt.chr.value.order$cgnum
+		regions[regions$chr == chr.name,][, sample.name.score] <- dt.chr.value.order$score
+		regions[regions$chr == chr.name,][, sample.name.coverage] <- dt.chr.value.order$coverage
+		regions[regions$chr == chr.name,][, sample.name.medianScore] <- dt.chr.value.order$medianScore
+		regions[regions$chr == chr.name,][, sample.name.meanScore] <- dt.chr.value.order$meanScore
+		regions[regions$chr == chr.name,][, sample.name.hmethy] <- dt.chr.value.order$hmethy
+		regions[regions$chr == chr.name,][, sample.name.umethy] <- dt.chr.value.order$umethy
+		regions[regions$chr == chr.name,][, sample.name.methyNum] <- dt.chr.value.order$methyNum
+
+
+    }
+
+}
+
+regions <- regions[regions$cgnum > 5,]
+maxScore <- apply(regions[,grep("meanScore", colnames(regions))], 1, max)
+minScore <- apply(regions[,grep("meanScore", colnames(regions))], 1, min)
+
+regions$maxScore <- maxScore
+regions$minScore <- minScore
+regions$diffScore <- regions$maxScore - regions$minScore
+
+
+
+#save the file
+savefile <- file.path(kOutputPath,"region.tissues.score.txt")
+write.table(regions, savefile, row.names = FALSE, col.names = TRUE, quote = FALSE, sep = "\t") 
+

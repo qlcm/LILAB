@@ -1,0 +1,260 @@
+#!/usr/bin/env Rscript
+
+# mtbr pipline
+
+# Load libraries
+
+suppressPackageStartupMessages(library("optparse", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("data.table", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("zoo", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("methyutils", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+suppressPackageStartupMessages(library("IRanges", quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+
+# function
+
+source("./cgDensity.lib.R")
+
+LowesNormalise <- function(rescale.data, cg.mtbr, kFracSpan, kBinSize){
+
+   rescale.data.cg <- rescale.data[cg.mtbr$posi,]
+   lowess.data <- lowess(rescale.data.cg$score, rescale.data.cg$density, f = kFracSpan)
+
+   # build segements
+
+   message("\tbuilding segements ", "\t", date())  
+   step <- (max(lowess.data$x) - min(lowess.data$x)) / kBinSize
+   x <- seq(min(lowess.data$x), max(lowess.data$x), step)
+   y <- approx(lowess.data, xout= x)$y
+   x.start <- head(x, -1)
+   y.start <- head(y, -1)
+   x.end <- tail(x, -1)
+   y.end <- tail(y, -1)
+   a <- (y.end - y.start) / (x.end - x.start)
+   b <- y.start - a * x.start
+   # theta <- -(atan(a) + (45 *pi / 180))
+   theta <- -45 * pi / 180
+   delta = (1 - x.start - y.start) / 2
+   df.seg <- data.frame(id = 1:length(x.start), xs = x.start, ys = y.start, xe = x.end, ye = y.end, delta = delta, theta = theta )
+   df.seg$xe[nrow(df.seg)] <- df.seg$xe[nrow(df.seg)] + 0.1 
+   rng.seg <- IRanges(start = df.seg$xs * 1e8, end = df.seg$xe * 1e8)
+   rng.score <- IRanges(start = rescale.data$score * 1e8, end = rescale.data$score * 1e8)
+   ov <- findOverlaps(rng.score, rng.seg, select = "first")
+   ov[is.na(ov)] <- 1
+   rescale.data$id <- ov
+   dt.rescale.data <- data.table(rescale.data)
+   dt.seg <- data.table(df.seg)
+   dt.rescale.data <- merge(dt.rescale.data, dt.seg, by = "id")
+   dt.rescale.data <- dt.rescale.data[order(dt.rescale.data$pos),]
+
+   dt.rescale.data$xt <- with(dt.rescale.data, score + delta)
+   dt.rescale.data$yt <- with(dt.rescale.data, density + delta)      
+   dt.rescale.data$cx <- with(dt.rescale.data, xs + delta)
+   dt.rescale.data$cy <- with(dt.rescale.data, ys + delta)
+   dt.rescale.data$xt <- with(dt.rescale.data, xt - cx)
+   dt.rescale.data$yt <- with(dt.rescale.data, yt - cy)
+   dt.rescale.data$xr <- with(dt.rescale.data, xt * cos(theta) - yt * sin(theta))
+   dt.rescale.data$yr <- with(dt.rescale.data, xt * sin(theta) + yt * cos(theta))
+   dt.rescale.data$score.t <- with(dt.rescale.data, xr + cx)
+   dt.rescale.data$density.t <- with(dt.rescale.data, yr + cy)
+   dt.rescale.data$icmp <- dt.rescale.data$density.t + dt.rescale.data$score.t - 1
+   dt.rescale.data$pdiff <- with(dt.rescale.data, abs(score.t - density.t) / (score.t + density.t))
+
+ return(dt.rescale.data)
+}
+
+GetBed <- function(dt.rescale.data, kGapDelta, kOverlapDelta, kRightDelta, kLeftDelta, kCutLen, kTolLen){
+   dt.rescale.data$ptype <- "M"
+   dt.rescale.data$ptype[dt.rescale.data$pdiff > kRightDelta] <- "H"
+   dt.rescale.data$ptype[dt.rescale.data$pdiff < kLeftDelta] <- "L"
+
+   dt.rescale.data$icmptype <- "M"
+   dt.rescale.data$icmptype[dt.rescale.data$icmp > kOverlapDelta] <- "H"
+   dt.rescale.data$icmptype[dt.rescale.data$icmp < -kGapDelta] <- "L"
+
+   dt.rescale.data$type <- "C"
+   dt.rescale.data$type[dt.rescale.data$icmptype == "H" & dt.rescale.data$ptype != "H"] <- "O"
+   dt.rescale.data$type[dt.rescale.data$icmptype == "L" & dt.rescale.data$ptype != "H"] <- "G"
+   dt.rescale.data$type[dt.rescale.data$icmptype == "M" & dt.rescale.data$ptype == "M"] <- "B"
+
+   cmarker <- dt.rescale.data$type == "C"
+   gmarker <- dt.rescale.data$type == "G"
+   omarker <- dt.rescale.data$type == "O"
+   bmarker <- dt.rescale.data$type == "B"
+   # get gap and overlap region
+
+   message("\tgetting regions","\t", date())
+   cregion <- regionAsBed(marker = cmarker, cf.length = kCutLen, tolerance.length = kTolLen, chrom = chr.name)
+   gregion <- regionAsBed(marker = gmarker, cf.length = kCutLen, tolerance.length = kTolLen, chrom = chr.name)
+   oregion <- regionAsBed(marker = omarker, cf.length = kCutLen, tolerance.length = kTolLen, chrom = chr.name)
+   bregion <- regionAsBed(marker = bmarker, cf.length = kCutLen, tolerance.length = kTolLen, chrom = chr.name)
+
+   cregion$type <- "C"
+   gregion$type <- "G"
+   oregion$type <- "O"
+   bregion$type <- "B"
+
+   cregion$s <- 0
+   gregion$s <- 0
+   oregion$s <- 0
+   bregion$s <- 0
+
+   cregion$strand <- "+"
+   gregion$strand <- "+"
+   oregion$strand <- "+"
+   bregion$strand <- "+"
+
+
+   cregion$thickstart <- cregion$start
+   gregion$thickstart <- gregion$start
+   oregion$thickstart <- oregion$start
+   bregion$thickstart <- bregion$start
+
+
+   cregion$thickend <- cregion$end
+   gregion$thickend <- gregion$end
+   oregion$thickend <- oregion$end
+   bregion$thickend <- bregion$end
+
+   cregion$color <- "255,0,0"
+   gregion$color <- "0,255,0"
+   oregion$color <- "0,0,255"
+   bregion$color <- "0,229,238"
+
+
+   df.regions <- rbind(cregion, gregion, oregion,bregion)
+
+return(df.regions)
+}
+
+##Specify desired options in a list
+
+option_list <- list(
+    make_option(c("-l","--genome-library"), help="Bioconductor BSgenome library name", default = "BSgenome.Mmusculus.UCSC.mm9"),
+    make_option(c("-n","--genome-name"), help="genome library object name. ex: \"Mmusculus\", \"Hsapiens\", \"Scerevisiae\"", default = "Mmusculus"),
+    make_option(c("-t","--genome-type"), help="genome type , example mm9, mm10, hg19, hg18, default is NULL", default = ""),
+    make_option(c("-w","--window-size"), help="sliding window size , default is 2500", default = 2500),
+    make_option(c("-b","--bin-size"), help="bin size , default is 5000", default = 5000),
+    make_option(c("-f","--frac-span"), help="frac span , default is 0.08", default = 0.08),
+    make_option(c("-g","--gap-delta"), help="gap delta , default is 0.5", default = 0.5),
+    make_option(c("-o","--overlap-delta"), help="overlap delta , default is 0.1", default = 0.1),
+	make_option(c("-i","--right-delta"), help="right delta , default is 0.75", default = 0.75),
+	make_option(c("-j","--left-delta"), help="left delta , default is 0.5", default = 0.5),
+    make_option(c("-e","--cut-len"), help="cutoff length , default is 500", default = 500),
+    make_option(c("-r","--tol-len"), help="tolerance length , default is 50", default = 50)
+)
+
+# Get command line options
+arguments <- parse_args(OptionParser(usage = "%prog [options] mtbrPath", option_list = option_list), positional_arguments = 1)
+opt <- arguments$options
+
+
+kGenomeLibrary <- opt$`genome-library`
+kGenomeName <- opt$`genome-name`
+kGenomeType <- opt$`genome-type`
+kWindowSize <- opt$`window-size`
+kMtbrPath <- arguments$args
+kBinSize <- opt$`bin-size`
+kFracSpan <- opt$`frac-span`
+kGapDelta <- opt$`gap-delta`
+kOverlapDelta <- opt$`overlap-delta`
+kRightDelta <- opt$`right-delta`
+kLeftDelta <- opt$`left-delta`
+kCutLen <- opt$`cut-len`
+kTolLen <- opt$`tol-len`
+
+# Get mtbr file names
+
+if(!file.exists(kMtbrPath)){
+	stop("mtbr file path \"", kMtbrPath ,"\" does not exist.")
+}
+
+mtbr.filenames <- list.files(kMtbrPath)
+
+# load the genome library
+
+kGenomeTypeList <- list(
+	mm9  = list(genome.library="BSgenome.Mmusculus.UCSC.mm9",genome.name="Mmusculus"),
+	mm10 = list(genome.library="BSgenome.Mmusculus.UCSC.mm10",genome.name="Mmusculus"),
+	hg18 = list(genome.library="BSgenome.Hsapiens.UCSC.hg18",genome.name="Hsapiens"),
+	hg19 = list(genome.library="BSgenome.Hsapiens.UCSC.hg19",genome.name="Hsapiens"),
+	hg38 = list(genome.library="BSgenome.Hsapiens.UCSC.hg38",genome.name="Hsapiens")
+)
+kGenome <- NULL
+
+if ( kGenomeType %in% names(kGenomeTypeList) ){
+	suppressPackageStartupMessages(library(kGenomeTypeList[[kGenomeType]][["genome.library"]], character.only = TRUE, quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+	kGenome <- get(kGenomeTypeList[[kGenomeType]][["genome.name"]]) 
+}else {
+	suppressPackageStartupMessages(library(kGenomeLibrary, character.only = TRUE, quietly=TRUE, verbose=FALSE, warn.conflicts=FALSE))
+	kGenome <- get(kGenomeName) 
+}
+
+if ( is.null(kGenome)){
+	stop( "Load Biocondutor Genome Library ERROR " )
+}
+
+# read and process the mtbr files
+for (file.name in mtbr.filenames){
+
+ 	file.path <- paste(kMtbrPath, "/", file.name, sep="")
+
+	 if(file_test("-f", file.path))
+	 {
+	 	message("[*] Processing ", file.name, "\t", date())
+	 	chr.name <- paste(head(unlist(strsplit(basename(file.name), ".", fixed = TRUE)), -1), sep="", collapse = "." )
+	 
+	 	# read the mtbr file
+	 	
+	 	message("\treading the mtbr file", "\t", date())
+	 	
+	 	load(file.path)
+	 	
+	 	# get CG Density
+	 	
+	 	message("\tgetting CG density ", "\t", date())
+	 	
+	 	dna.seq <- kGenome[[chr.name]]
+	 	ref.length <- length(dna.seq)
+		density <- GetDensity(cg.mtbr, kWindowSize, ref.length)
+
+		# get Score 
+		
+		message("\tgetting Score ", "\t", date())
+		score <- GetScore(cg.mtbr, kWindowSize, ref.length)
+
+	 	# rescale
+
+		message("\trescaling ", "\t", date())
+	 	rescale.data <- RescaleData(density, score)
+ 		rescale.data$pos <- 1:nrow(rescale.data)
+
+ 		#  lowess
+
+ 		message("\tlowess regression ", "\t", date())
+ 		
+ 		dt.rescale.data <- LowesNormalise(rescale.data, cg.mtbr, kFracSpan, kBinSize)
+
+ 		# Get regions
+		message("\tgetting regions","\t", date())
+
+		df.regions <- GetBed(dt.rescale.data, kGapDelta, kOverlapDelta, kRightDelta, kLeftDelta, kCutLen, kTolLen)
+		# write regions file
+
+		message("\twritting regions file","\t", date())
+		write.table(df.regions, paste("./", chr.name, ".regions.bed", sep = ""), row.names = FALSE, col.names = FALSE, quote = FALSE, sep = "\t")
+
+	 	# write wig file
+
+		message("\twritting wig file","\t", date())
+		head <- paste("fixedStep chrom=", chr.name, " start=1 step=1\n", sep = "")
+		score.wig <- file.path(paste("./", chr.name, ".score.trans.wig", sep = ""))
+		density.wig <- file.path(paste("./", chr.name, ".density.trans.wig", sep = ""))
+
+		cat(head, file = score.wig, append = TRUE)
+		cat(head, file = density.wig, append = TRUE)
+	
+		write.table(dt.rescale.data$score.t, score.wig, row.names = FALSE, col.names = FALSE, quote = FALSE, append = TRUE, sep = "\t")
+		write.table(dt.rescale.data$density.t, density.wig, row.names = FALSE, col.names = FALSE, quote = FALSE, append = TRUE, sep = "\t")
+	 }
+
+}
